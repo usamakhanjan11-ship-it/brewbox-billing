@@ -6,7 +6,10 @@ from decimal import Decimal
 from typing import Callable
 
 from .models import (
+    CREDIT_VALID_DAYS,
     LATE_FEE,
+    MAX_REFERRAL_CREDIT,
+    REFERRAL_RATE,
     TAX_RATE,
     CreditEntry,
     Customer,
@@ -53,12 +56,24 @@ class BillingService:
             raise ValueError("customer email is required")
         if not referral_code:
             raise ValueError("referral code is required")
+
         if any(c.email == email for c in self.repo.customers.values()):
             raise ValueError("email already registered")
+
         if self.repo.customer_by_referral_code(referral_code) is not None:
             raise ValueError("referral code already in use")
+
         if referred_by is not None:
             referred_by = referred_by.strip().upper()
+
+            if not referred_by:
+                raise ValueError("referral code cannot be blank")
+            if referred_by == referral_code:
+                raise ValueError("self-referral is not allowed")
+
+            referrer = self.repo.customer_by_referral_code(referred_by)
+            if referrer is None:
+                raise ValueError("referral code does not exist")
 
         customer = Customer(
             id=self.repo.next_id("cus"),
@@ -95,6 +110,8 @@ class BillingService:
         discount = Decimal(str(discount_percent))
         if discount < 0:
             raise ValueError("discount cannot be negative")
+        if discount > 30:
+            raise ValueError("discount cannot exceed 30%")
 
         subscription = Subscription(
             id=self.repo.next_id("sub"),
@@ -151,23 +168,26 @@ class BillingService:
         plan = self.repo.plans[subscription.plan_code]
 
         # Mid-month starts use a simple 30-day convention. Add-ons are charged
+      
         # in full on the first invoice.
-        if subscription.start_date <= period_start:
-            factor = Decimal("1")
-        else:
-            billable_days = (period_end - subscription.start_date).days
-            factor = Decimal(billable_days) / Decimal("30")
+        days_in_month = calendar.monthrange(period_end.year, period_end.month)[1]
+        active_days = self._active_days(subscription, period_start, period_end)
+        factor = Decimal(active_days) / Decimal(days_in_month)
+      
 
         plan_amount = money(plan.monthly_price * factor)
         addon_amounts = [
-            (self.repo.addons[code], money(self.repo.addons[code].monthly_price))
-            for code in subscription.addon_codes
-        ]
+    (
+        self.repo.addons[code],
+        money(self.repo.addons[code].monthly_price * factor),
+    )
+    for code in subscription.addon_codes
+]
         subtotal = money(plan_amount + sum((amount for _, amount in addon_amounts), Decimal("0")))
 
         # Discount is currently calculated from the whole recurring subtotal.
         discount_total = money(
-            subtotal * subscription.discount_percent / Decimal("100")
+            plan_amount * subscription.discount_percent / Decimal("100")
         )
         taxable = money(subtotal - discount_total)
         tax_total = money(taxable * TAX_RATE)
@@ -245,7 +265,7 @@ class BillingService:
             return invoice
         if invoice.amount_due <= 0:
             return invoice
-        if day < invoice.due_on + timedelta(days=5):
+        if day < invoice.due_on + timedelta(days=6):
             return invoice
         if invoice.late_fee > 0:
             return invoice
@@ -256,14 +276,30 @@ class BillingService:
         return invoice
 
     def credit_balance(self, customer_id: str, as_of: date | None = None) -> Decimal:
-        return Decimal("0.00")
+        day = as_of or self._today()
+
+        balance = sum(
+            (
+                credit.remaining
+                for credit in self.repo.credits.values()
+                if credit.customer_id == customer_id
+                and credit.remaining > 0
+                and day < credit.expires_on
+            ),
+            Decimal("0.00"),
+        )
+        return money(balance)
 
     def list_credits(self, customer_id: str) -> list[CreditEntry]:
-        return []
+        return [
+            credit
+            for credit in self.repo.credits.values()
+            if credit.customer_id == customer_id
+        ]
 
-    # ------------------------------------------------------------------
     # Pause / resume
     # ------------------------------------------------------------------
+   
     def pause_subscription(
         self,
         subscription_id: str,
@@ -271,13 +307,75 @@ class BillingService:
         end: date,
         as_of: date | None = None,
     ) -> PausePeriod:
-        raise NotImplementedError("FEAT-201: pause and resume are not implemented")
+        subscription = self.repo.subscriptions.get(subscription_id)
 
-    def resume_subscription(self, subscription_id: str, on: date) -> PausePeriod:
-        raise NotImplementedError("FEAT-201: pause and resume are not implemented")
+        if subscription is None:
+            raise ValueError("Subscription not found")
+
+        if subscription.cancelled_on is not None:
+            raise ValueError("Cannot pause a cancelled subscription")
+
+        if start < subscription.start_date:
+            raise ValueError("Pause cannot start before the subscription")
+
+        if start > end:
+            raise ValueError("Invalid pause dates")
+
+        days = (end - start).days + 1
+        if days < 7 or days > 90:
+            raise ValueError("Pause must be between 7 and 90 days")
+
+        for existing_pause in subscription.pauses:
+            if existing_pause.overlaps(PausePeriod(start, end)):
+                raise ValueError("Pause dates cannot overlap")
+
+        request_date = as_of or self._today()
+
+        for invoice in self.repo.invoices.values():
+            if (
+                invoice.customer_id == subscription.customer_id
+                and invoice.due_on < request_date
+                and invoice.amount_due > 0
+            ):
+                raise ValueError(
+                    "Cannot pause with an overdue unpaid invoice"
+                )
+
+        pause = PausePeriod(start, end)
+        subscription.pauses.append(pause)
+        return pause 
+
+
+    
+    def resume_subscription(
+        self, subscription_id: str, on: date
+    ) -> PausePeriod:
+        subscription = self.repo.subscriptions.get(subscription_id)
+
+        if subscription is None:
+            raise ValueError("Subscription not found")
+
+        for index, pause in enumerate(subscription.pauses):
+            if pause.start < on <= pause.end:
+                new_end = on - timedelta(days=1)
+                updated_pause = PausePeriod(pause.start, new_end)
+
+                if updated_pause.days < 7:
+                    raise ValueError("Pause must be at least 7 days")
+
+                subscription.pauses[index] = updated_pause
+                return updated_pause
+
+        raise ValueError("No active pause found for the resume date")
 
     def list_pauses(self, subscription_id: str) -> list[PausePeriod]:
-        raise NotImplementedError("FEAT-201: pause and resume are not implemented")
+        subscription = self.repo.subscriptions.get(subscription_id)
+
+        if subscription is None:
+            raise ValueError("Subscription not found")
+
+        return list(subscription.pauses)
+
 
     # ------------------------------------------------------------------
     # Internals
@@ -299,9 +397,21 @@ class BillingService:
     ) -> int:
         start = max(period_start, subscription.start_date)
         end = period_end
+
         if start > end:
             return 0
-        return (end - start).days + 1
+
+        active_days = (end - start).days + 1
+
+        for pause in subscription.pauses:
+            overlap_start = max(start, pause.start)
+            overlap_end = min(end, pause.end)
+
+            if overlap_start <= overlap_end:
+                paused_days = (overlap_end - overlap_start).days + 1
+                active_days -= paused_days
+
+        return max(active_days, 0)
 
     def _find_invoice(
         self, subscription_id: str, year: int, month: int
@@ -316,7 +426,71 @@ class BillingService:
         return None
 
     def _apply_available_credits(self, invoice: Invoice, as_of: date) -> None:
-        return None
+        available = sorted(
+            (
+                credit
+                for credit in self.repo.credits.values()
+                if credit.customer_id == invoice.customer_id
+                and credit.remaining > 0
+                and as_of < credit.expires_on
+            ),
+            key=lambda credit: (credit.expires_on, credit.issued_on, credit.id),
+        )
+
+        for credit in available:
+            due = invoice.amount_due
+            if due <= 0:
+                break
+
+            applied = money(min(credit.remaining, due))
+            if applied <= 0:
+                continue
+
+            credit.remaining = money(credit.remaining - applied)
+            invoice.credit_applied = money(invoice.credit_applied + applied)
 
     def _award_referral_credit(self, invoice: Invoice, paid_on: date) -> None:
-        return None
+        referee = self.repo.customers.get(invoice.customer_id)
+        if referee is None or referee.referred_by is None:
+            return
+
+        # Only the referee's first-created invoice can earn referral credit.
+        customer_invoices = self.repo.invoices_for_customer(referee.id)
+        if not customer_invoices or customer_invoices[0].id != invoice.id:
+            return
+
+        # Never award a second referral credit for the same referee.
+        already_awarded = any(
+            credit.source_customer_id == referee.id
+            for credit in self.repo.credits.values()
+        )
+        if already_awarded:
+            return
+
+        referrer = self.repo.customer_by_referral_code(referee.referred_by)
+        if referrer is None or referrer.id == referee.id:
+            return
+
+        eligible_amount = money(invoice.subtotal - invoice.discount_total)
+        if eligible_amount <= 0:
+            return
+
+        amount = money(min(
+            eligible_amount * REFERRAL_RATE,
+            MAX_REFERRAL_CREDIT,
+        ))
+        if amount <= 0:
+            return
+
+        credit = CreditEntry(
+            id=self.repo.next_id("cred"),
+            customer_id=referrer.id,
+            source_customer_id=referee.id,
+            source_invoice_id=invoice.id,
+            amount=amount,
+            remaining=amount,
+            issued_on=paid_on,
+            expires_on=paid_on + timedelta(days=CREDIT_VALID_DAYS),
+            reason="Referral reward",
+        )
+        self.repo.credits[credit.id] = credit
